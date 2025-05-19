@@ -575,28 +575,41 @@ func (s *Session) sendLoop() (err error) {
 			lastWriteDeadline = now.Add(s.config.ConnectionWriteTimeout)
 			return s.conn.SetWriteDeadline(lastWriteDeadline)
 		}
+		
 		return nil
 	}
+// ---- write-coalescing (re-enabled) ---------------------------------
 
-	writer := s.conn
+var (
+    bufWriter *bufio.Writer
+    writer    io.Writer = s.conn
+    wcDelay               = s.config.WriteCoalesceDelay
+)
 
-	// FIXME: https://github.com/libp2p/go-libp2p/issues/644
-	// Write coalescing is disabled for now.
+if wcDelay > 0 {
+    // 64 KiB buffer – feel free to tweak.
+    bufWriter = bufio.NewWriterSize(s.conn, 64<<10)
+    writer    = bufWriter
+}
 
-	// writer := pool.Writer{W: s.conn}
+var (
+    flushT *time.Timer
+    flushC <-chan time.Time
+)
 
-	// var writeTimeout *time.Timer
-	// var writeTimeoutCh <-chan time.Time
-	// if s.config.WriteCoalesceDelay > 0 {
-	//	writeTimeout = time.NewTimer(s.config.WriteCoalesceDelay)
-	//	defer writeTimeout.Stop()
+if wcDelay > 0 {
+    flushT = time.NewTimer(wcDelay)
+    flushT.Stop()           // inactive until first write
+    flushC = flushT.C
+} else {
+    // closed channel so <-flushC never blocks
+    ch := make(chan time.Time)
+    close(ch)
+    flushC = ch
+}
 
-	//	writeTimeoutCh = writeTimeout.C
-	// } else {
-	//	ch := make(chan time.Time)
-	//	close(ch)
-	//	writeTimeoutCh = ch
-	// }
+// --------------------------------------------------------------------
+
 
 	for {
 		// yield after processing the last message, if we've shutdown.
@@ -605,8 +618,16 @@ func (s *Session) sendLoop() (err error) {
 		case <-s.shutdownCh:
 			return nil
 		default:
+		
+	    case <-flushC:
+		if bufWriter != nil {
+			if err := bufWriter.Flush(); err != nil {
+				if os.IsTimeout(err) { err = ErrConnectionWriteTimeout }
+				return err
+			}
 		}
-
+		if flushT != nil { flushT.Reset(wcDelay) }
+		}
 		var buf []byte
 		// Make sure to send any pings & pongs first so they don't get stuck behind writes.
 		select {
@@ -665,6 +686,19 @@ func (s *Session) sendLoop() (err error) {
 
 		_, err := writer.Write(buf)
 		pool.Put(buf)
+// (re)start the timer after the first buffered write
+if flushT != nil {
+    if !flushT.Stop() { <-flushC } // drain
+    flushT.Reset(wcDelay)
+}
+
+// If buffer is full, flush right now
+if bufWriter != nil && bufWriter.Buffered() >= bufWriter.Size() {
+    if err2 := bufWriter.Flush(); err2 != nil {
+        if os.IsTimeout(err2) { err2 = ErrConnectionWriteTimeout }
+        return err2
+    }
+}
 
 		if err != nil {
 			if os.IsTimeout(err) {
