@@ -578,7 +578,7 @@ func (s *Session) sendLoop() (err error) {
 
 		return nil
 	}
-// ---- (re-enabled)------
+// ---- (re-enabled)------``
 
 var (
     bufWriter *bufio.Writer
