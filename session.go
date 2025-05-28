@@ -578,7 +578,7 @@ func (s *Session) sendLoop() (err error) {
 
 		return nil
 	}
-// ---- write-coalescing (re-enabled)
+// ---- write-coalescing (re-enabled)------
 
 var (
     bufWriter *bufio.Writer
