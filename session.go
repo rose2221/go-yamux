@@ -595,7 +595,18 @@ var (
     flushT *time.Timer
     flushC <-chan time.Time
 )
+controlMsg := func(hdr header) bool {
+    switch hdr.MsgType() {
+    case typePing, typeWindowUpdate, typeGoAway:
+        return true
+    default:
+        return false
+    }
+}
 
+// How much space must remain free for control frames
+const ctrlHeadRoom = 16 * 1024 // 16 KiB
+const highWaterPct = 80 
 if wcDelay > 0 {
     flushT = time.NewTimer(wcDelay)
     flushT.Stop()           // inactive until first write
@@ -689,6 +700,20 @@ if wcDelay > 0 {
 if flushT != nil {
     if !flushT.Stop() { <-flushC } // drain
     flushT.Reset(wcDelay)
+}
+if bufWriter != nil && !controlMsg(*(*header)(unsafe.Pointer(&buf[0]))) {
+    // if buffer would overflow past head-room, flush first
+    if bufWriter.Buffered() > bufWriter.Size()-ctrlHeadRoom {
+        _ = bufWriter.Flush()
+    }
+}
+// If buffer ≥ 80 % full, flush immediately
+if bufWriter != nil &&
+   bufWriter.Buffered()*100 >= bufWriter.Size()*highWaterPct {
+    if err2 := bufWriter.Flush(); err2 != nil {
+        if os.IsTimeout(err2) { err2 = ErrConnectionWriteTimeout }
+        return err2
+    }
 }
 
 // If buffer is full, flush right now
