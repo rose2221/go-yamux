@@ -697,6 +697,15 @@ if wcDelay > 0 {
 		_, err := writer.Write(buf)
 		pool.Put(buf)
 // (re)start the timer after the first buffered write
+
+    if bufWriter != nil && controlMsg(*(*header)(unsafe.Pointer(&buf[0]))) {
+        if err2 := bufWriter.Flush(); err2 != nil {
+            if os.IsTimeout(err2) {
+                err2 = ErrConnectionWriteTimeout
+            }
+            return err2          // bail out on flush error
+        }
+    }
 if flushT != nil {
     if !flushT.Stop() { <-flushC } // drain
     flushT.Reset(wcDelay)
