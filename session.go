@@ -120,6 +120,8 @@ type Session struct {
 	keepaliveLock   sync.Mutex
 	keepaliveTimer  *time.Timer
 	keepaliveActive bool
+
+	 unflushedBytes int64   // bytes sitting in bufWriter but not yet on the wire
 }
 
 // newSession is used to construct a new session
@@ -688,6 +690,10 @@ if wcDelay > 0 {
 				//	}
 			}
 		}
+// add length to unflushedBytes **only if** we’re batching
+if s.config.WriteCoalesceDelay > 0 {
+    atomic.AddInt64(&s.unflushedBytes, int64(len(body)))
+}
 
 		if err := extendWriteDeadline(); err != nil {
 			pool.Put(buf)
@@ -724,6 +730,18 @@ if bufWriter != nil &&
         return err2
     }
 }
+// var bufferedBytes int // <-- declare near bufWriter
+
+// // After every writer.Write(buf):
+// bufferedBytes += len(buf)
+
+// // In every place you flush on purpose (timer, fast-lane, high-water):
+// if bufWriter != nil {
+//     if err := bufWriter.Flush(); err != nil { … }
+//     atomic.AddInt64(&s.bytesOnWire, int64(bufferedBytes))
+//     bufferedBytes = 0
+// }
+
 
 // If buffer is full, flush right now
 if bufWriter != nil && bufWriter.Buffered() >= bufWriter.Size() {
