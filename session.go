@@ -627,12 +627,12 @@ func (s *Session) sendLoop() (err error) {
 	// --------------------------------------------------------------------
 
 	for {
+		var buf []byte
 		// yield after processing the last message, if we've shutdown.
 		// s.sendCh is a buffered channel and Go doesn't guarantee select order.
 		select {
 		case <-s.shutdownCh:
 			return nil
-		default:
 
 		case <-flushC:
 			if bufWriter != nil {
@@ -646,10 +646,11 @@ func (s *Session) sendLoop() (err error) {
 			if flushT != nil {
 				flushT.Reset(wcDelay)
 			}
-		}
-		var buf []byte
-		// Make sure to send any pings & pongs first so they don't get stuck behind writes.
-		select {
+			// }
+			// var buf []byte
+			// // Make sure to send any pings & pongs first so they don't get stuck behind writes.
+			// select {
+			continue
 		case pingID := <-s.pingCh:
 			buf = pool.Get(headerSize)
 			hdr := encode(typePing, flagSYN, 0, pingID)
@@ -659,44 +660,62 @@ func (s *Session) sendLoop() (err error) {
 			hdr := encode(typePing, flagACK, 0, pingID)
 			copy(buf, hdr[:])
 		default:
-			// Then send normal data.
+			// Blocking select for normal data (also wake on timer).
 			select {
+			case <-s.shutdownCh:
+				return nil
+
+			case <-flushC:
+				if bufWriter != nil {
+					if err := bufWriter.Flush(); err != nil {
+						if os.IsTimeout(err) {
+							err = ErrConnectionWriteTimeout
+						}
+						return err
+					}
+				}
+				if flushT != nil {
+					flushT.Reset(wcDelay)
+				}
+				continue
+
 			case buf = <-s.sendCh:
+				// got data
+
 			case pingID := <-s.pingCh:
 				buf = pool.Get(headerSize)
 				hdr := encode(typePing, flagSYN, 0, pingID)
 				copy(buf, hdr[:])
+
 			case pingID := <-s.pongCh:
 				buf = pool.Get(headerSize)
 				hdr := encode(typePing, flagACK, 0, pingID)
 				copy(buf, hdr[:])
-			case <-s.shutdownCh:
-				return nil
-				// default:
-				//	select {
-				//	case buf = <-s.sendCh:
-				//	case <-s.shutdownCh:
-				//		return nil
-				//	case <-writeTimeoutCh:
-				//		if err := writer.Flush(); err != nil {
-				//			if os.IsTimeout(err) {
-				//				err = ErrConnectionWriteTimeout
-				//			}
-				//			return err
-				//		}
-
-				//		select {
-				//		case buf = <-s.sendCh:
-				//		case <-s.shutdownCh:
-				//			return nil
-				//		}
-
-				//		if writeTimeout != nil {
-				//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
-				//		}
-				//	}
 			}
 		}
+		// default:
+		//	select {
+		//	case buf = <-s.sendCh:
+		//	case <-s.shutdownCh:
+		//		return nil
+		//	case <-writeTimeoutCh:
+		//		if err := writer.Flush(); err != nil {
+		//			if os.IsTimeout(err) {
+		//				err = ErrConnectionWriteTimeout
+		//			}
+		//			return err
+		//		}
+
+		//		select {
+		//		case buf = <-s.sendCh:
+		//		case <-s.shutdownCh:
+		//			return nil
+		//		}
+
+		//		if writeTimeout != nil {
+		//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
+		//		}
+		//	}
 
 		// before writing, extend deadline as you already do…
 		if err := extendWriteDeadline(); err != nil {

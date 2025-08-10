@@ -1892,7 +1892,7 @@ func TestWriteCoalescing_BatchesSyscalls(t *testing.T) {
 	defer server.Close()
 
 	const N = 200
-
+	ready := make(chan struct{})
 	// Server: accept and read exactly N bytes.
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1900,6 +1900,8 @@ func TestWriteCoalescing_BatchesSyscalls(t *testing.T) {
 		defer wg.Done()
 		str, err := server.AcceptStream()
 		require.NoError(t, err)
+
+		close(ready)
 		require.NoError(t, str.SetReadDeadline(time.Now().Add(3*time.Second)))
 		defer str.Close()
 
@@ -1921,6 +1923,8 @@ func TestWriteCoalescing_BatchesSyscalls(t *testing.T) {
 	// Client: open and write N single-byte payloads quickly.
 	str, err := client.OpenStream(context.Background())
 	require.NoError(t, err)
+
+	<-ready
 
 	pc := client.conn.(*pipeConn)
 	startWrites := atomic.LoadInt64(&pc.writeCount)
