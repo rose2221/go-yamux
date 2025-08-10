@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	pool "github.com/libp2p/go-buffer-pool"
 	"io"
 	"log"
 	"math"
@@ -16,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	pool "github.com/libp2p/go-buffer-pool"
 )
 
 // The MemoryManager allows management of memory allocations.
@@ -740,7 +741,10 @@ func (s *Session) sendLoop() (err error) {
 		// restart the flush timer after a buffered write
 		if flushT != nil {
 			if !flushT.Stop() {
-				<-flushC
+				select {
+				case <-flushC: // drain a pending tick if there is one
+				default: // nothing to drain; don't block!
+				}
 			} // drain fired tick if any
 			flushT.Reset(wcDelay)
 		}
