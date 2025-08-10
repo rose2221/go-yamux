@@ -694,29 +694,29 @@ func (s *Session) sendLoop() (err error) {
 				copy(buf, hdr[:])
 			}
 		}
-			// default:
-			//	select {
-			//	case buf = <-s.sendCh:
-			//	case <-s.shutdownCh:
-			//		return nil
-			//	case <-writeTimeoutCh:
-			//		if err := writer.Flush(); err != nil {
-			//			if os.IsTimeout(err) {
-			//				err = ErrConnectionWriteTimeout
-			//			}
-			//			return err
-			//		}
+				// default:
+				//	select {
+				//	case buf = <-s.sendCh:
+				//	case <-s.shutdownCh:
+				//		return nil
+				//	case <-writeTimeoutCh:
+				//		if err := writer.Flush(); err != nil {
+				//			if os.IsTimeout(err) {
+				//				err = ErrConnectionWriteTimeout
+				//			}
+				//			return err
+				//		}
 
-			//		select {
-			//		case buf = <-s.sendCh:
-			//		case <-s.shutdownCh:
-			//			return nil
-			//		}
+				//		select {
+				//		case buf = <-s.sendCh:
+				//		case <-s.shutdownCh:
+				//			return nil
+				//		}
 
-			//		if writeTimeout != nil {
-			//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
-			//		}
-			//	}
+				//		if writeTimeout != nil {
+				//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
+				//		}
+				//	}
 
 		// before writing, extend deadline as you already do…
 		if err := extendWriteDeadline(); err != nil {
