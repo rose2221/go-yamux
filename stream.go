@@ -188,10 +188,10 @@ START:
 
 	// // Reduce our send window
 	// atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
-if s.session.config.WriteCoalesceDelay == 0 {
-    // only count bytes as sent immediately when we are NOT batching
-    atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
-}
+	if s.session.config.WriteCoalesceDelay == 0 {
+		// only count bytes as sent immediately when we are NOT batching
+		atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
+	}
 
 	// Unlock
 	return int(max), err

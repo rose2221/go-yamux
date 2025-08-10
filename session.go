@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	pool "github.com/libp2p/go-buffer-pool"
 	"io"
 	"log"
 	"math"
@@ -14,8 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	pool "github.com/libp2p/go-buffer-pool"
+	"unsafe"
 )
 
 // The MemoryManager allows management of memory allocations.
@@ -120,8 +120,6 @@ type Session struct {
 	keepaliveLock   sync.Mutex
 	keepaliveTimer  *time.Timer
 	keepaliveActive bool
-
-	 unflushedBytes int64   // bytes sitting in bufWriter but not yet on the wire
 }
 
 // newSession is used to construct a new session
@@ -580,48 +578,53 @@ func (s *Session) sendLoop() (err error) {
 
 		return nil
 	}
+	var (
+		bufWriter *bufio.Writer
+		writer    io.Writer = s.conn
+		wcDelay             = s.config.WriteCoalesceDelay
+	)
 
-var (
-    bufWriter *bufio.Writer
-    writer    io.Writer = s.conn
-    wcDelay               = s.config.WriteCoalesceDelay
-)
+	if wcDelay > 0 {
+		// 64 KiB buffer.
+		bufWriter = bufio.NewWriterSize(s.conn, 64<<10)
+		writer = bufWriter
+	}
 
-if wcDelay > 0 {
-    // 64 KiB buffer – feel free to tweak.
-    bufWriter = bufio.NewWriterSize(s.conn, 64<<10)
-    writer    = bufWriter
-}
+	var (
+		flushT *time.Timer
+		flushC <-chan time.Time
+	)
+	if wcDelay > 0 {
+		flushT = time.NewTimer(wcDelay)
+		flushT.Stop() // inactive until first write
+		flushC = flushT.C
+	} else {
+		// closed channel so <-flushC never blocks
+		ch := make(chan time.Time)
+		close(ch)
+		flushC = ch
+	}
+	// control messages classification for fast-lane
+	controlMsg := func(hdr header) bool {
+		switch hdr.MsgType() {
+		case typePing, typeWindowUpdate, typeGoAway:
+			return true
+		default:
+			return false
+		}
+	}
 
-var (
-    flushT *time.Timer
-    flushC <-chan time.Time
-)
-controlMsg := func(hdr header) bool {
-    switch hdr.MsgType() {
-    case typePing, typeWindowUpdate, typeGoAway:
-        return true
-    default:
-        return false
-    }
-}
+	// How much space must remain free for control frames
+	const ctrlHeadRoom = 16 * 1024 // 16 KiB
+	const highWaterPct = 80
+	defer func() {
+		// best effort flush on exit
+		if bufWriter != nil {
+			_ = bufWriter.Flush()
+		}
+	}()
 
-// How much space must remain free for control frames
-const ctrlHeadRoom = 16 * 1024 // 16 KiB
-const highWaterPct = 80 
-if wcDelay > 0 {
-    flushT = time.NewTimer(wcDelay)
-    flushT.Stop()           // inactive until first write
-    flushC = flushT.C
-} else {
-    // closed channel so <-flushC never blocks
-    ch := make(chan time.Time)
-    close(ch)
-    flushC = ch
-}
-
-// --------------------------------------------------------------------
-
+	// --------------------------------------------------------------------
 
 	for {
 		// yield after processing the last message, if we've shutdown.
@@ -630,15 +633,19 @@ if wcDelay > 0 {
 		case <-s.shutdownCh:
 			return nil
 		default:
-		
-	    case <-flushC:
-		if bufWriter != nil {
-			if err := bufWriter.Flush(); err != nil {
-				if os.IsTimeout(err) { err = ErrConnectionWriteTimeout }
-				return err
+
+		case <-flushC:
+			if bufWriter != nil {
+				if err := bufWriter.Flush(); err != nil {
+					if os.IsTimeout(err) {
+						err = ErrConnectionWriteTimeout
+					}
+					return err
+				}
 			}
-		}
-		if flushT != nil { flushT.Reset(wcDelay) }
+			if flushT != nil {
+				flushT.Reset(wcDelay)
+			}
 		}
 		var buf []byte
 		// Make sure to send any pings & pongs first so they don't get stuck behind writes.
@@ -690,66 +697,66 @@ if wcDelay > 0 {
 				//	}
 			}
 		}
-// add length to unflushedBytes **only if** we’re batching
-if s.config.WriteCoalesceDelay > 0 {
-    atomic.AddInt64(&s.unflushedBytes, int64(len(body)))
-}
 
+		// before writing, extend deadline as you already do…
 		if err := extendWriteDeadline(); err != nil {
 			pool.Put(buf)
 			return err
 		}
 
+		// write to the coalescing writer (or raw conn if disabled)
 		_, err := writer.Write(buf)
+
+		// FAST-LANE: flush immediately for control frames
+		if bufWriter != nil && controlMsg(*(*header)(unsafe.Pointer(&buf[0]))) {
+			if err2 := bufWriter.Flush(); err2 != nil {
+				if os.IsTimeout(err2) {
+					err2 = ErrConnectionWriteTimeout
+				}
+				pool.Put(buf)
+				return err2
+			}
+		}
+
+		// restart the flush timer after a buffered write
+		if flushT != nil {
+			if !flushT.Stop() {
+				<-flushC
+			} // drain fired tick if any
+			flushT.Reset(wcDelay)
+		}
+
+		// keep headroom so control frames aren’t blocked
+		if bufWriter != nil && !controlMsg(*(*header)(unsafe.Pointer(&buf[0]))) {
+			if bufWriter.Buffered() > bufWriter.Size()-ctrlHeadRoom {
+				_ = bufWriter.Flush() // best effort; errors handled by next write
+			}
+		}
+
+		// high-water immediate flush (~80 % full)
+		if bufWriter != nil &&
+			bufWriter.Buffered()*100 >= bufWriter.Size()*highWaterPct {
+			if err2 := bufWriter.Flush(); err2 != nil {
+				if os.IsTimeout(err2) {
+					err2 = ErrConnectionWriteTimeout
+				}
+				pool.Put(buf)
+				return err2
+			}
+		}
+
+		// hard full — must flush (rare with the above)
+		if bufWriter != nil && bufWriter.Buffered() >= bufWriter.Size() {
+			if err2 := bufWriter.Flush(); err2 != nil {
+				if os.IsTimeout(err2) {
+					err2 = ErrConnectionWriteTimeout
+				}
+				pool.Put(buf)
+				return err2
+			}
+		}
+
 		pool.Put(buf)
-// (re)start the timer after the first buffered write
-
-    if bufWriter != nil && controlMsg(*(*header)(unsafe.Pointer(&buf[0]))) {
-        if err2 := bufWriter.Flush(); err2 != nil {
-            if os.IsTimeout(err2) {
-                err2 = ErrConnectionWriteTimeout
-            }
-            return err2          // bail out on flush error
-        }
-    }
-if flushT != nil {
-    if !flushT.Stop() { <-flushC } // drain
-    flushT.Reset(wcDelay)
-}
-if bufWriter != nil && !controlMsg(*(*header)(unsafe.Pointer(&buf[0]))) {
-    // if buffer would overflow past head-room, flush first
-    if bufWriter.Buffered() > bufWriter.Size()-ctrlHeadRoom {
-        _ = bufWriter.Flush()
-    }
-}
-// If buffer ≥ 80 % full, flush immediately
-if bufWriter != nil &&
-   bufWriter.Buffered()*100 >= bufWriter.Size()*highWaterPct {
-    if err2 := bufWriter.Flush(); err2 != nil {
-        if os.IsTimeout(err2) { err2 = ErrConnectionWriteTimeout }
-        return err2
-    }
-}
-// var bufferedBytes int // <-- declare near bufWriter
-
-// // After every writer.Write(buf):
-// bufferedBytes += len(buf)
-
-// // In every place you flush on purpose (timer, fast-lane, high-water):
-// if bufWriter != nil {
-//     if err := bufWriter.Flush(); err != nil { … }
-//     atomic.AddInt64(&s.bytesOnWire, int64(bufferedBytes))
-//     bufferedBytes = 0
-// }
-
-
-// If buffer is full, flush right now
-if bufWriter != nil && bufWriter.Buffered() >= bufWriter.Size() {
-    if err2 := bufWriter.Flush(); err2 != nil {
-        if os.IsTimeout(err2) { err2 = ErrConnectionWriteTimeout }
-        return err2
-    }
-}
 
 		if err != nil {
 			if os.IsTimeout(err) {

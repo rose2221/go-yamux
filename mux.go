@@ -80,7 +80,7 @@ func DefaultConfig() *Config {
 		LogOutput:               os.Stderr,
 		ReadBufSize:             4096,
 		MaxMessageSize:          64 * 1024,
-		WriteCoalesceDelay:      100 * time.Microsecond,
+		WriteCoalesceDelay:      2 * time.Microsecond,
 	}
 }
 

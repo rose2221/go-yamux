@@ -43,6 +43,8 @@ type pipeConn struct {
 	closeCh       chan struct{}
 	closeOnce     sync.Once
 	closeErr      error
+	writeCount    int64 // counts underlying net.Conn.Write calls
+
 }
 
 func (p *pipeConn) SetDeadline(t time.Time) error {
@@ -64,6 +66,7 @@ func (p *pipeConn) Write(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	n, err := p.Conn.Write(b)
+	atomic.AddInt64(&p.writeCount, 1)
 	<-p.writeBlocker
 	return n, err
 }
@@ -125,6 +128,12 @@ func testClientServerConfig(conf *Config) (*Session, *Session) {
 	client, _ := Client(conn1, conf, nil)
 	server, _ := Server(conn2, conf, nil)
 	return client, server
+}
+
+func mustPing(t *testing.T, s *Session) {
+	t.Helper()
+	_, err := s.Ping()
+	require.NoError(t, err)
 }
 
 func TestClientClient(t *testing.T) {
@@ -1873,4 +1882,96 @@ func TestErrorCodeErrorIsErrStreamReset(t *testing.T) {
 	require.True(t, errors.Is(se, ErrStreamReset))
 	ge := &GoAwayError{}
 	require.True(t, errors.Is(ge, ErrStreamReset))
+}
+
+func TestWriteCoalescing_BatchesSyscalls(t *testing.T) {
+	cfg := testConfNoKeepAlive()
+	cfg.WriteCoalesceDelay = 5 * time.Millisecond // enable coalescing with small latency cap
+	client, server := testClientServerConfig(cfg)
+	defer client.Close()
+	defer server.Close()
+
+	const N = 200
+
+	// Server: accept and read exactly N bytes.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		str, err := server.AcceptStream()
+		require.NoError(t, err)
+		require.NoError(t, str.SetReadDeadline(time.Now().Add(3*time.Second)))
+		defer str.Close()
+
+		buf := make([]byte, N)
+		total := 0
+		for total < N {
+			n, err := str.Read(buf[total:])
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				require.NoError(t, err)
+			}
+			total += n
+		}
+		require.Equal(t, N, total)
+	}()
+
+	// Client: open and write N single-byte payloads quickly.
+	str, err := client.OpenStream(context.Background())
+	require.NoError(t, err)
+
+	pc := client.conn.(*pipeConn)
+	startWrites := atomic.LoadInt64(&pc.writeCount)
+
+	for i := 0; i < N; i++ {
+		n, err := str.Write([]byte("x"))
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+	}
+	_, err = client.Ping()
+	require.NoError(t, err)
+	// Give the flush timer a moment to fire.
+	time.Sleep(2 * cfg.WriteCoalesceDelay)
+
+	require.NoError(t, str.CloseWrite())
+	wg.Wait()
+
+	endWrites := atomic.LoadInt64(&pc.writeCount)
+	delta := endWrites - startWrites
+
+	// We wrote N app-messages; we expect FAR fewer conn writes due to coalescing.
+	if delta >= N/2 {
+		t.Fatalf("expected coalesced writes; conn writes=%d (>= %d)", delta, N/2)
+	}
+}
+
+func TestWriteCoalescing_ControlFlushesImmediately(t *testing.T) {
+	cfg := testConfNoKeepAlive()
+	cfg.WriteCoalesceDelay = 200 * time.Millisecond // long delay to catch regressions
+	client, server := testClientServerConfig(cfg)
+	defer client.Close()
+	defer server.Close()
+
+	_ = server.conn.(*pipeConn).SetDeadline(time.Now().Add(3 * time.Second))
+	// Open a stream and write a tiny payload that would otherwise sit in the buffer.
+	str, err := client.OpenStream(context.Background())
+	require.NoError(t, err)
+	_, err = str.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	// Send a control frame (Ping). The implementation should flush immediately.
+	start := time.Now()
+	rtt, err := client.Ping()
+	require.NoError(t, err)
+
+	elapsed := time.Since(start)
+	_ = rtt // we only care that this didn't have to wait for wcDelay
+
+	if elapsed >= cfg.WriteCoalesceDelay/2 {
+		t.Fatalf("control frame did not flush immediately; elapsed %v ≥ %v", elapsed, cfg.WriteCoalesceDelay/2)
+	}
+
+	_ = str.CloseWrite()
 }
